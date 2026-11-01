@@ -1,5 +1,6 @@
 use super::app::{InputPrompt, TuiApp};
 use crate::job::{DownloadStatus, PieceStatus, TorrentJobSnapshot};
+use crate::peer::PeerConnectionStats;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -217,8 +218,13 @@ fn draw_job_details(
     selected: &TorrentJobSnapshot,
     executables_text: Option<&String>,
 ) {
-    let [info_area, piece_map_area] =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
+    let [info_area, peers_area, piece_map_area] = Layout::horizontal([
+        Constraint::Percentage(40),
+        Constraint::Percentage(30),
+        Constraint::Percentage(30),
+    ])
+    .areas(area);
+    draw_connected_peers(frame, peers_area, &selected.connected_peers);
     let [gauge_area, details_list_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).areas(info_area);
 
@@ -284,6 +290,43 @@ fn draw_job_details(
         selected.target_threads
     )));
     frame.render_widget(piece_map, piece_map_area);
+}
+
+/// One line per open connection, fastest first, so the user can see whether the limit is
+/// choking peers, slow peers, or too few connections.
+fn draw_connected_peers(frame: &mut Frame, area: Rect, connected_peers: &[PeerConnectionStats]) {
+    let choked_count = connected_peers
+        .iter()
+        .filter(|peer| peer.is_choked)
+        .count();
+    let peer_lines: Vec<ListItem> = connected_peers
+        .iter()
+        .map(|peer| {
+            let transfer = if peer.is_choked {
+                Span::styled("CHOKED", Style::default().fg(Color::Yellow))
+            } else {
+                Span::styled(
+                    format!("{}/s", format_bytes(peer.download_bps)),
+                    Style::default().fg(Color::Green),
+                )
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{:<22}", peer.addr.to_string())),
+                transfer,
+                Span::styled(
+                    format!("  q{}", peer.request_queue_limit),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+
+    let peers = List::new(peer_lines).block(Block::default().borders(Borders::ALL).title(format!(
+        " Peers: {} connected, {} choked ",
+        connected_peers.len(),
+        choked_count
+    )));
+    frame.render_widget(peers, area);
 }
 
 fn draw_getting_started(frame: &mut Frame, area: Rect) {

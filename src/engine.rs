@@ -183,20 +183,36 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         alpha_job.resume().await;
 
+        let mut has_seen_connected_peer = false;
         for _ in 0..80 {
+            let beta_snapshot = beta_job.snapshot(0).await;
+            has_seen_connected_peer |= !beta_snapshot.connected_peers.is_empty();
             let alpha_status = alpha_job.snapshot(0).await.status;
-            let beta_status = beta_job.snapshot(0).await.status;
-            if alpha_status == DownloadStatus::Completed && beta_status == DownloadStatus::Completed
+            if alpha_status == DownloadStatus::Completed
+                && beta_snapshot.status == DownloadStatus::Completed
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        assert!(has_seen_connected_peer, "peer stats must be reported while downloading");
 
         assert_eq!(alpha_job.snapshot(0).await.status, DownloadStatus::Completed);
         assert_eq!(beta_job.snapshot(0).await.status, DownloadStatus::Completed);
         assert!(steam_common.join("TestGameAlpha/TestGameAlpha.exe").exists());
         assert!(steam_common.join("TestGameBeta/TestGameBeta.exe").exists());
+        let mut has_cleared_peer_stats = false;
+        for _ in 0..20 {
+            if beta_job.snapshot(0).await.connected_peers.is_empty() {
+                has_cleared_peer_stats = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            has_cleared_peer_stats,
+            "workers must drop their peer stats once the download completes"
+        );
 
         let manifest_path = steam_common.join("TestGameAlpha/.torrent_resume.json");
         let mut is_manifest_complete = false;

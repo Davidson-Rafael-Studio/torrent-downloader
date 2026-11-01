@@ -45,7 +45,8 @@ Treat any of these as a stop-and-check signal:
 | TUI state, key handling, user actions | `tui/app.rs` |
 | Drawing the TUI (pure rendering from state) | `tui/draw.rs` |
 | Download queue, adding/removing jobs, cross-job thread tuning | `engine.rs` |
-| One torrent job's state and the rules that keep it consistent (pause, pieces, status, announces) | `job/mod.rs` |
+| One torrent job's state and the rules that keep it consistent (pause, status, peers, announces) | `job/mod.rs` |
+| Piece claiming, release, completion, disk writes | `job/pieces.rs` |
 | A job's background loops (speed meter, resume saver, periodic re-announce) | `job/tasks.rs` |
 | Known peers and failure backoff (pure, no I/O) | `job/peer_pool.rs` |
 | Piece-download workers of one job | `worker.rs` |
@@ -53,7 +54,7 @@ Treat any of these as a stop-and-check signal:
 | Disk writes, resume manifest, on-disk verification | `storage.rs` |
 | `.torrent` parsing, info hash | `torrent.rs` |
 | Tracker announces | `tracker.rs` |
-| Peer wire protocol | `peer.rs` |
+| Peer wire protocol and the adaptive request pipeline | `peer.rs` |
 | Steam paths, game folder naming, executables | `steam.rs` |
 | Input path normalization, `.torrent` discovery | `path_utils.rs` |
 | Local tracker/seeder for demo and tests | `seeder.rs` |
@@ -72,7 +73,7 @@ Rules:
 
 | File | Production lines | Status | Natural seam if it must grow |
 |---|---|---|---|
-| `job/mod.rs` | ~530 | One responsibility, but over the ~400 check; background loops and peer tracking already moved out | Next seam: piece bookkeeping (`claim_next_pending_piece`, `release_piece`, `complete_piece`, `store_verified_piece`) into `job/pieces.rs` |
+| `job/mod.rs` | ~476 | One responsibility, but over the ~400 check; background loops, peer pool and piece bookkeeping already moved out | Next seam: status/pause handling (`pause`, `resume`, `toggle_pause`, `set_status_unless_paused`) into `job/status.rs` |
 
 Keep the boundaries: `tui/draw.rs` only renders, `tui/app.rs` never draws, `worker.rs` changes job state only through `TorrentJob` methods, and `job/` never depends on `engine.rs`, `worker.rs`, or the TUI.
 

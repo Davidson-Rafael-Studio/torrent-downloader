@@ -1,12 +1,15 @@
 mod peer_pool;
+mod pieces;
 mod tasks;
 
-use crate::storage::{save_resume_state, write_piece_to_disk};
+use crate::peer::PeerConnectionStats;
+use crate::storage::save_resume_state;
 use crate::torrent::TorrentMeta;
 use crate::tracker::{discover_peers, AnnounceEvent};
 use anyhow::Result;
 use peer_pool::PeerPool;
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -61,6 +64,8 @@ pub struct TorrentJob {
     piece_states: RwLock<Vec<PieceStatus>>,
     pending_pieces: Mutex<VecDeque<usize>>,
     peer_pool: Mutex<PeerPool>,
+    /// Live connection stats keyed by worker index; each worker owns at most one connection.
+    connected_peers: Mutex<HashMap<usize, PeerConnectionStats>>,
     has_announced: AtomicBool,
     reannounce_interval_secs: AtomicU64,
     downloaded_bytes: AtomicU64,
@@ -94,6 +99,8 @@ pub struct TorrentJobSnapshot {
     pub peer_count: usize,
     /// Known peers that are not backing off after failed connections.
     pub available_peer_count: usize,
+    /// Open connections, fastest first.
+    pub connected_peers: Vec<PeerConnectionStats>,
     pub files_count: usize,
     pub piece_states_preview: Vec<PieceStatus>,
 }
@@ -160,6 +167,7 @@ impl TorrentJob {
             piece_states: RwLock::new(piece_states),
             pending_pieces: Mutex::new(pending_pieces),
             peer_pool: Mutex::new(PeerPool::default()),
+            connected_peers: Mutex::new(HashMap::new()),
             has_announced: AtomicBool::new(false),
             reannounce_interval_secs: AtomicU64::new(DEFAULT_REANNOUNCE_INTERVAL_SECS),
             downloaded_bytes: AtomicU64::new(initial_bytes),
@@ -212,29 +220,30 @@ impl TorrentJob {
         self.active_workers.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn lock_peer_pool(&self) -> MutexGuard<'_, PeerPool> {
-        // Peer entries are plain values, so data left by a panicked holder is still valid.
-        self.peer_pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     pub(crate) fn has_peers(&self) -> bool {
-        !self.lock_peer_pool().is_empty()
+        !lock_ignoring_poison(&self.peer_pool).is_empty()
     }
 
     /// Picks a peer that is not backing off after failures; `spread_offset` spreads
     /// different workers and pieces across peers. `None` means every known peer is backing off.
     pub(crate) fn pick_peer(&self, spread_offset: usize) -> Option<SocketAddr> {
-        self.lock_peer_pool().pick(spread_offset, Instant::now())
+        lock_ignoring_poison(&self.peer_pool).pick(spread_offset, Instant::now())
+    }
+
+    pub(crate) fn update_peer_connection(&self, worker_index: usize, stats: PeerConnectionStats) {
+        lock_ignoring_poison(&self.connected_peers).insert(worker_index, stats);
+    }
+
+    pub(crate) fn forget_peer_connection(&self, worker_index: usize) {
+        lock_ignoring_poison(&self.connected_peers).remove(&worker_index);
     }
 
     pub(crate) fn record_peer_success(&self, peer_addr: SocketAddr) {
-        self.lock_peer_pool().record_success(peer_addr);
+        lock_ignoring_poison(&self.peer_pool).record_success(peer_addr);
     }
 
     pub(crate) fn record_peer_failure(&self, peer_addr: SocketAddr) {
-        self.lock_peer_pool()
+        lock_ignoring_poison(&self.peer_pool)
             .record_failure(peer_addr, Instant::now());
     }
 
@@ -251,9 +260,16 @@ impl TorrentJob {
             .collect();
 
         let peer_pool_counts = {
-            let peer_pool = self.lock_peer_pool();
+            let peer_pool = lock_ignoring_poison(&self.peer_pool);
             (peer_pool.len(), peer_pool.available_count(Instant::now()))
         };
+
+        let mut connected_peers: Vec<PeerConnectionStats> =
+            lock_ignoring_poison(&self.connected_peers)
+                .values()
+                .copied()
+                .collect();
+        connected_peers.sort_unstable_by_key(|peer| Reverse(peer.download_bps));
 
         TorrentJobSnapshot {
             id: self.id,
@@ -272,6 +288,7 @@ impl TorrentJob {
             is_auto_threads: self.is_auto_threads.load(Ordering::Relaxed),
             peer_count: peer_pool_counts.0,
             available_peer_count: peer_pool_counts.1,
+            connected_peers,
             files_count: self.meta.files.len(),
             piece_states_preview,
         }
@@ -375,82 +392,6 @@ impl TorrentJob {
         *self.status_message.write().await = message.into();
     }
 
-    async fn mark_completed(&self) {
-        *self.status.write().await = DownloadStatus::Completed;
-        self.speed_bps.store(0, Ordering::Relaxed);
-        self.set_status_message(format!(
-            "Completed! Saved to Steam: {}",
-            self.game_install_dir.display()
-        ))
-        .await;
-    }
-
-    fn lock_pending_pieces(&self) -> MutexGuard<'_, VecDeque<usize>> {
-        // The queue holds plain indices, so data left by a panicked holder is still valid.
-        self.pending_pieces
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    pub(crate) async fn claim_next_pending_piece(&self) -> Option<usize> {
-        let piece_index = self.lock_pending_pieces().pop_front()?;
-        self.piece_states.write().await[piece_index] = PieceStatus::InProgress;
-        Some(piece_index)
-    }
-
-    pub(crate) async fn release_piece(&self, piece_index: usize) {
-        self.piece_states.write().await[piece_index] = PieceStatus::Pending;
-        self.lock_pending_pieces().push_back(piece_index);
-    }
-
-    /// Records a verified piece and returns the new completed-piece count.
-    async fn complete_piece(&self, piece_index: usize) -> usize {
-        self.piece_states.write().await[piece_index] = PieceStatus::Completed;
-        self.is_resume_state_dirty.store(true, Ordering::Relaxed);
-        self.downloaded_bytes
-            .fetch_add(self.meta.piece_size(piece_index), Ordering::Relaxed);
-        self.completed_pieces_count
-            .fetch_add(1, Ordering::Release)
-            + 1
-    }
-
-    async fn write_piece(&self, piece_index: usize, piece_bytes: Vec<u8>) -> Result<()> {
-        let meta = self.meta.clone();
-        let game_install_dir = self.game_install_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            write_piece_to_disk(&meta, &game_install_dir, piece_index, &piece_bytes)
-        })
-        .await?
-    }
-
-    pub(crate) async fn store_verified_piece(&self, piece_index: usize, piece_bytes: Vec<u8>) {
-        if let Err(error) = self.write_piece(piece_index, piece_bytes).await {
-            self.release_piece(piece_index).await;
-            *self.status.write().await = DownloadStatus::Error;
-            self.set_status_message(format!(
-                "Disk write error for piece {piece_index}: {error:#}"
-            ))
-            .await;
-            return;
-        }
-
-        let completed_count = self.complete_piece(piece_index).await;
-        if completed_count == self.meta.pieces.len() {
-            self.mark_completed().await;
-        } else if self
-            .set_status_unless_paused(DownloadStatus::Downloading)
-            .await
-        {
-            // Setting Downloading above also clears an Error from an earlier failed disk write.
-            self.set_status_message(format!(
-                "Downloading piece {}/{} via {} thread(s)",
-                completed_count,
-                self.meta.pieces.len(),
-                self.target_threads.load(Ordering::Relaxed)
-            ))
-            .await;
-        }
-    }
 
     async fn persist_resume_state(&self) -> Result<()> {
         let completed_pieces: Vec<bool> = self
@@ -486,7 +427,7 @@ impl TorrentJob {
         }
 
         let (new_peer_count, known_peer_count) = {
-            let mut peer_pool = self.lock_peer_pool();
+            let mut peer_pool = lock_ignoring_poison(&self.peer_pool);
             let new_peer_count = peer_pool.merge(response.peers);
             (new_peer_count, peer_pool.len())
         };
@@ -526,4 +467,10 @@ impl TorrentJob {
     pub(crate) async fn wait_for_wake_or_timeout(&self, timeout: Duration) {
         let _ = tokio::time::timeout(timeout, self.wake_workers.notified()).await;
     }
+}
+
+/// The mutexes in a job guard plain values (indices, peer entries) that stay valid even if a
+/// holder panicked, so a poisoned lock is recovered instead of propagating the panic.
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
